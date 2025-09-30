@@ -12,20 +12,23 @@ jobs:
     if: github.event.action == 'converted_to_draft'
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch requested reviewers
-        id: get
-        run: |
-          curl -sSL -H "Authorization: Bearer ${{ github.token }}" \
-            -H "Accept: application/vnd.github+json" \
-            "${{ github.api_url }}/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/requested_reviewers" > reviewers.json
-          echo "users=$(jq -c '.users | map(.login)' reviewers.json)" >> $GITHUB_OUTPUT
-          echo "teams=$(jq -c '.teams | map(.slug)' reviewers.json)" >> $GITHUB_OUTPUT
-
-      - name: Remove requested reviewers
-        if: ${{ steps.get.outputs.users != '[]' || steps.get.outputs.teams != '[]' }}
-        run: |
-          curl -sSL -X DELETE -H "Authorization: Bearer ${{ github.token }}" \
-            -H "Accept: application/vnd.github+json" \
-            -d "{\"reviewers\": ${{ steps.get.outputs.users }}, \"team_reviewers\": ${{ steps.get.outputs.teams }}}" \
-            "${{ github.api_url }}/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/requested_reviewers"
+      - name: Clear requested reviewers on convert-to-draft
+        if: github.event.action == 'converted_to_draft'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const number = context.payload.pull_request.number;
+            const rr = await github.rest.pulls.listRequestedReviewers({owner, repo, pull_number: number});
+            const users = rr.data.users.map(u => u.login);
+            const teams = rr.data.teams.map(t => t.slug);
+            console.log(users);
+            console.log(teams);
+            if (users.length || teams.length) {
+              await github.rest.pulls.removeRequestedReviewers({
+                owner, repo, pull_number: number,
+                reviewers: users,
+                team_reviewers: teams
+              });
+            }
 
