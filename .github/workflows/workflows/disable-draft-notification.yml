@@ -1,0 +1,31 @@
+name: Tame CODEOWNERS pings
+
+on:
+  pull_request:
+    types: [converted_to_draft, ready_for_review]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  on-convert-to-draft:
+    if: github.event.action == 'converted_to_draft'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch requested reviewers
+        id: get
+        run: |
+          curl -sSL -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/requested_reviewers" > reviewers.json
+          echo "users=$(jq -c '.users | map(.login)' reviewers.json)" >> $GITHUB_OUTPUT
+          echo "teams=$(jq -c '.teams | map(.slug)' reviewers.json)" >> $GITHUB_OUTPUT
+
+      - name: Remove requested reviewers
+        if: ${{ steps.get.outputs.users != '[]' || steps.get.outputs.teams != '[]' }}
+        run: |
+          curl -sSL -X DELETE -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            -d "{\"reviewers\": ${{ steps.get.outputs.users }}, \"team_reviewers\": ${{ steps.get.outputs.teams }}}" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/requested_reviewers"
+
