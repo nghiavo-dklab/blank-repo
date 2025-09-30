@@ -1,0 +1,114 @@
+# .github/workflows/auto-approve-label.yml
+name: auto-approve-label
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 * * * *"  # hourly sweep to catch 48h threshold
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write   # needed to add labels to PRs (issues API)
+
+jobs:
+  mark-approved:
+    runs-on: ubuntu-latest
+    env:
+      LABEL_HOLD: "X"          # <-- your “hold for 2 days” label
+      LABEL_APPROVED: "Approved"
+      COOLDOWN_HOURS: "1"
+    steps:
+      - name: Decide & label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const LABEL_HOLD = process.env.LABEL_HOLD;
+            const LABEL_APPROVED = process.env.LABEL_APPROVED;
+            const COOLDOWN_HOURS = Number(process.env.COOLDOWN_HOURS);
+
+            // Get target PR numbers for this run:
+            // - For PR/review events: just the one from context
+            // - For cron: sweep all open PRs
+            let prNumbers = [];
+            if (context.eventName === "schedule" || context.eventName === "workflow_dispatch") {
+              const all = await github.paginate(github.rest.pulls.list, {
+                owner: context.repo.owner, repo: context.repo.repo, state: "open"
+              });
+              prNumbers = all.map(p => p.number);
+            } else {
+              const pr = context.payload.pull_request || context.payload.review?.pull_request;
+              if (!pr) return;
+              prNumbers = [pr.number];
+            }
+
+            for (const number of prNumbers) {
+              // Fetch PR state, labels, reviews & timeline anchor events
+              const data = await github.graphql(`
+                query($owner:String!, $repo:String!, $number:Int!) {
+                  repository(owner:$owner, name:$repo) {
+                    pullRequest(number:$number) {
+                      number
+                      isDraft
+                      reviewDecision   # APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | null
+                      labels(first: 100) { nodes { name } }
+                      timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT, LABELED_EVENT], last: 200) {
+                        nodes {
+                          __typename
+                          ... on ReadyForReviewEvent { createdAt }
+                          ... on LabeledEvent { createdAt, label { name } }
+                        }
+                      }
+                    }
+                  }
+                }`,
+                { owner: context.repo.owner, repo: context.repo.repo, number }
+              );
+
+              const pr = data.repository.pullRequest;
+              const labels = pr.labels.nodes.map(l => l.name);
+
+              // If already labeled Approved, skip
+              if (labels.includes(LABEL_APPROVED)) continue;
+
+              // Condition (B): Approved -> add label immediately
+              if (pr.reviewDecision === "APPROVED") {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: number,
+                  labels: [LABEL_APPROVED]
+                });
+                continue;
+              }
+
+              // Must be Ready for review (not draft)
+              if (pr.isDraft) continue;
+
+              // Must currently have label X
+              if (!labels.includes(LABEL_HOLD)) continue;
+
+              // Find latest RFR and latest time label X was applied
+              const items = pr.timelineItems.nodes;
+              const rfrTimes = items
+                .filter(n => n.__typename === "ReadyForReviewEvent")
+                .map(n => new Date(n.createdAt));
+              const labelTimes = items
+                .filter(n => n.__typename === "LabeledEvent" && n.label?.name === LABEL_HOLD)
+                .map(n => new Date(n.createdAt));
+
+              if (rfrTimes.length === 0 || labelTimes.length === 0) continue;
+
+              const anchor = [rfrTimes.sort((a,b)=>b-a)[0], labelTimes.sort((a,b)=>b-a)[0]]
+                .sort((a,b)=>b-a)[0]; // later of latest RFR and latest label application
+
+              const ageHours = (Date.now() - anchor.getTime()) / 36e5;
+
+              if (ageHours >= COOLDOWN_HOURS) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: number,
+                  labels: [LABEL_APPROVED]
+                });
+              }
+            }
